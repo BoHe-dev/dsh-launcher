@@ -1,6 +1,6 @@
 {
   "port": 3080,
-  "serverCommand": "npx @deepseek-ai/dsh web",
+  "serverCommand": "npx @deepseek-ai/dsh web --no-open",
   "workspace": "",
   "profileDir": "",
   "chromeAppId": "",

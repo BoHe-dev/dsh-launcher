@@ -11,6 +11,19 @@
 //   one when a plugin change is confirmed, one when the restart begins, plus errors.
 // - Everything user-specific is configurable via config.json next to the exe
 //   (see Config.Load). The Chrome PWA app-id is auto-detected when not configured.
+// - Authentication: since DSH 0.1.5 the web surface is gated behind a per-process
+//   launch token. `dsh web` prints "dsh web: http://127.0.0.1:<port>/?token=..."
+//   and every other request - including /api/* - is answered 401 until the
+//   browser presents the signed session cookie that the token exchange mints.
+//   The launcher therefore:
+//     * reads that URL line from the server's stdout,
+//     * exchanges the token once for a session cookie it keeps for its own
+//       /api calls (and caches on disk so a later run can attach to a server it
+//       did not start),
+//     * opens the UI at the authenticated URL, where the browser performs the
+//       same exchange and ends up on the clean URL,
+//     * and treats a 401 as "the server is up", because it no longer is a
+//       startup failure - it is an unauthenticated request.
 // - Test-only environment overrides (documented in README):
 //   DSH_MUTEX_SUFFIX - separate single-instance identity (e.g. "test")
 //   DSH_WATCH_DIR    - plugin directory to watch instead of the configured one
@@ -32,7 +45,7 @@ namespace DshLauncher
 {
     static class Program
     {
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.3";
         public const string AppName = "DeepSeek Harness";
 
         internal static readonly string Suffix = Environment.GetEnvironmentVariable("DSH_MUTEX_SUFFIX") ?? "";
@@ -89,8 +102,17 @@ namespace DshLauncher
 
     class Config
     {
+        // The old default; kept so an existing config written by 1.0.2 can be
+        // migrated to the --no-open form below.
+        public const string LegacyServerCommand = "npx @deepseek-ai/dsh web";
+        // --no-open: DSH opens the default browser itself once the tree settles,
+        // which would race the launcher's own window (and open the clean URL,
+        // which now answers 401 until the token exchange has happened). The
+        // launcher owns opening the UI, so the server must not.
+        public const string DefaultServerCommand = "npx @deepseek-ai/dsh web --no-open";
+
         public int port = 3080;
-        public string serverCommand = "npx @deepseek-ai/dsh web";
+        public string serverCommand = DefaultServerCommand;
         public string workspace = "";          // server working dir; "" = exe dir
         public string profileDir = "";         // plugin watch dir; "" = ~/.dsh/profiles/web
         public string chromeAppId = "";        // "" = auto-detect the DSH Chrome PWA
@@ -163,6 +185,17 @@ namespace DshLauncher
                 "dsh-launcher", "config.json");
         }
 
+        // The launcher's own DSH browser session (the signed cookie the token
+        // exchange mints), cached beside the config so a later run can still ask
+        // /api/* when it attached to a server it did not start - the launch token
+        // is per-process and cannot be recovered. The cookie is scoped to one
+        // authority and expires with the deployment's cookieMaxAgeDays (30 by
+        // default); deleting this file just costs one token exchange.
+        public static string SessionPath()
+        {
+            return Path.Combine(Path.GetDirectoryName(ConfigPath()), "browser-session.json");
+        }
+
         static void Apply(Config cfg, Dictionary<string, object> dict)
         {
             foreach (var kv in dict)
@@ -192,6 +225,10 @@ namespace DshLauncher
                 }
                 catch { }
             }
+            // 1.0.2 shipped a serverCommand without --no-open. Upgrading only the
+            // untouched default keeps hand-written commands exactly as they are.
+            if (string.Equals(cfg.serverCommand, LegacyServerCommand, StringComparison.OrdinalIgnoreCase))
+                cfg.serverCommand = DefaultServerCommand;
         }
 
         static string ToJson(Config cfg)
@@ -236,6 +273,7 @@ namespace DshLauncher
             { "startup_timeout", "服务启动超时，请检查网络后重试（可再次双击本程序重新打开界面）" },
             { "confirm_restart_busy", "有聊天工作正在进行，重启会中断它。确定要现在重启服务吗？" },
             { "watchdog_restart", "服务异常退出，正在自动重启" },
+            { "auth_missing", "服务已在运行，但本程序拿不到它的访问令牌。请用 dsh web 启动时打印的带 token 的网址打开界面。" },
             { "config_failed", "config.json 解析失败，已使用默认配置。\n错误信息：{0}" },
             { "about_text", "DeepSeek Harness 托盘启动器\n版本 {0}\n\n自动启动服务、监控插件变动、聊天结束后自动重启。" },
         };
@@ -254,6 +292,7 @@ namespace DshLauncher
             { "startup_timeout", "Service startup timed out; check your network and double-click this app again" },
             { "confirm_restart_busy", "Chat work is in progress and will be interrupted. Restart the service anyway?" },
             { "watchdog_restart", "The service stopped unexpectedly; restarting automatically" },
+            { "auth_missing", "The service is running, but this app has no access token for it. Open the UI with the token URL printed by dsh web." },
             { "config_failed", "config.json could not be parsed; using defaults.\nError: {0}" },
             { "about_text", "DeepSeek Harness tray launcher\nVersion {0}\n\nStarts the service, watches plugin changes and restarts automatically after chat work finishes." },
         };
@@ -302,10 +341,20 @@ namespace DshLauncher
         // blocks on network / WMI / netstat calls)
         volatile bool serverUp;
         volatile bool busy;
+        volatile bool busyKnown;           // false = the server could not be asked
         Thread pollThread;
         volatile bool pollRunning;
         volatile bool everUp;              // saw the server up at least once
         long lastServerUpTicks;            // Interlocked ticks of the last up sighting
+
+        // DSH web authentication (see the file header). The launch token is
+        // per-process: it arrives on the server's stdout and dies with it.
+        readonly CookieContainer authCookies = new CookieContainer();
+        volatile string authUrl = "";      // http://127.0.0.1:<port>/?token=...
+        volatile bool authPending;         // an open request is waiting for authUrl
+        DateTime authPendingSinceUtc;
+        volatile bool authWarned;          // the user was already told, once
+        volatile bool authLogged;          // the log already carries the diagnosis
 
         public TrayContext(EventWaitHandle openEvent)
         {
@@ -328,9 +377,11 @@ namespace DshLauncher
                 : Path.Combine(Path.GetTempPath(), "dsh-launcher" + Program.Suffix + ".log");
             noRestart = Environment.GetEnvironmentVariable("DSH_NO_RESTART") == "1";
             appId = cfg.chromeAppId.Length > 0 ? cfg.chromeAppId : DetectChromeAppId();
+            LoadBrowserSession();
             Log("--- " + cfg.appName + " " + Program.Version + " start, port=" + cfg.port
                 + ", watch=" + watchDir + ", appId=" + (appId.Length > 0 ? appId : "(none)")
-                + ", lang=" + cfg.language + ", noRestart=" + noRestart);
+                + ", lang=" + cfg.language + ", noRestart=" + noRestart
+                + ", sessionCookie=" + (authCookies.Count > 0 ? "cached" : "none"));
 
             icon = new NotifyIcon();
             icon.Icon = LoadAppIcon();
@@ -415,7 +466,21 @@ namespace DshLauncher
                     if (tick * 1000 >= cfg.idlePollSeconds * 1000)
                     {
                         tick = 0;
-                        busy = AnySessionRunning();
+                        bool known;
+                        bool running = AnySessionRunning(out known);
+                        busyKnown = known;
+                        // An unanswerable /api is not evidence of an idle server:
+                        // assume work is running so an auto restart can never
+                        // interrupt a chat it failed to observe.
+                        busy = known ? running : true;
+                        // Not worth reporting while a server we started has simply
+                        // not printed its token yet - that resolves on its own.
+                        bool starting = weStartedServer && authUrl.Length == 0;
+                        if (!known && !starting && !authLogged && serverUp)
+                        {
+                            authLogged = true;
+                            Log("session state unavailable (no authenticated session); auto restart is paused");
+                        }
                     }
                 }
                 catch { }
@@ -429,7 +494,25 @@ namespace DshLauncher
         {
             DateTime now = DateTime.UtcNow;
 
-            // 0) watchdog: the server was up but has now been down for a while and
+            // 0) an open request deferred until the server printed its token URL.
+            if (authPending)
+            {
+                if (authUrl.Length > 0)
+                {
+                    authPending = false;
+                    Log("token URL captured -> opening UI");
+                    OpenApp();
+                }
+                else if (now.Subtract(authPendingSinceUtc).TotalSeconds > 30)
+                {
+                    authPending = false;
+                    Log("token URL never arrived; opening the plain URL");
+                    Balloon(lang.T("auth_missing"), ToolTipIcon.Warning);
+                    OpenUrl(url);
+                }
+            }
+
+            // 0b) watchdog: the server was up but has now been down for a while and
             //    it is not because of us - bring it back. Only armed after the
             //    initial startup finished (readyTimer == null).
             if (cfg.watchdog && everUp && !serverUp && restartPhase == 0
@@ -646,8 +729,10 @@ namespace DshLauncher
         void MenuRestart()
         {
             if (restartPhase != 0) return;
-            // Don't kill running work on a stray click.
-            if (busy)
+            // Don't kill running work on a stray click. An *unknown* busy state is
+            // not a reason to interrogate the user: it only means /api could not be
+            // asked, and the restart is what they just asked for.
+            if (busyKnown && busy)
             {
                 DialogResult r = MessageBox.Show(lang.T("confirm_restart_busy"),
                     cfg.appName, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
@@ -668,6 +753,11 @@ namespace DshLauncher
                 return;
             }
             Log("BeginRestart");
+            // The launch token belongs to the process about to be killed; the next
+            // server prints a fresh one on its stdout. The cached session cookie
+            // survives, because it is signed by the deployment's persisted secret.
+            authUrl = "";
+            authPending = false;
             // Tell the user first: the web UIs are about to close and the screen
             // will go blank for a few seconds - without this it looks frozen.
             Balloon(lang.T("restarting"));
@@ -696,26 +786,26 @@ namespace DshLauncher
         void CloseWebUIs()
         {
             var pids = new List<int>();
-            if (appId.Length > 0)
+            // Chrome decides the window's command line, so the only reliable way to
+            // find the DSH windows is to look: an installed PWA carries --app-id,
+            // the authenticated window carries --app=<our url> (token included).
+            // The netstat sweep below is the fallback when this finds nothing.
+            try
             {
-                try
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='chrome.exe'"))
                 {
-                    using (var searcher = new System.Management.ManagementObjectSearcher(
-                        "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='chrome.exe'"))
+                    foreach (var obj in searcher.Get())
                     {
-                        foreach (var obj in searcher.Get())
-                        {
-                            string cmd = Convert.ToString(obj["CommandLine"]);
-                            if (cmd != null && cmd.IndexOf("--app-id=" + appId,
-                                    StringComparison.OrdinalIgnoreCase) >= 0)
-                                pids.Add(Convert.ToInt32(obj["ProcessId"]));
-                        }
+                        string cmd = Convert.ToString(obj["CommandLine"]);
+                        if (cmd != null && IsDshWindowCommandLine(cmd))
+                            pids.Add(Convert.ToInt32(obj["ProcessId"]));
                     }
                 }
-                catch (Exception ex)
-                {
-                    Log("WMI chrome scan failed: " + ex.Message);
-                }
+            }
+            catch (Exception ex)
+            {
+                Log("WMI chrome scan failed: " + ex.Message);
             }
             if (pids.Count == 0)
             {
@@ -775,6 +865,18 @@ namespace DshLauncher
                     Log("Close web UI failed: " + ex.Message);
                 }
             }
+        }
+
+        // True for a Chrome window this launcher opened for DSH: the installed PWA
+        // (--app-id=<id>) or the authenticated app window (--app="<our url>/...").
+        // The slash after the port keeps :3080 from matching a :30800 window.
+        bool IsDshWindowCommandLine(string cmd)
+        {
+            if (appId.Length > 0 && cmd.IndexOf("--app-id=" + appId,
+                    StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            return cmd.IndexOf("--app=", StringComparison.OrdinalIgnoreCase) >= 0
+                && cmd.IndexOf(url + "/", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         void KillServer()
@@ -876,7 +978,19 @@ namespace DshLauncher
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                serverProcess = Process.Start(psi);
+                // The authenticated URL line only exists on stdout, so it has to be
+                // captured. Both streams are read asynchronously: a synchronous
+                // read would deadlock as soon as a pipe buffer filled up.
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                var proc = new Process();
+                proc.StartInfo = psi;
+                proc.OutputDataReceived += OnServerOutput;
+                proc.ErrorDataReceived += OnServerOutput;
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                serverProcess = proc;
                 weStartedServer = true;
                 // A fresh server rewrites profile files at startup; don't treat
                 // those as plugin changes.
@@ -890,14 +1004,175 @@ namespace DshLauncher
             }
         }
 
+        // Server stdout/stderr, off the UI thread. The only line that matters is
+        //   dsh web: http://127.0.0.1:3080/?token=<launch token> (LAN: ...)
+        // which is the sole way to learn the per-process token.
+        void OnServerOutput(object sender, DataReceivedEventArgs e)
+        {
+            if (e == null || e.Data == null)
+                return;
+            string line = e.Data.Trim();
+            if (line.Length == 0)
+                return;
+            // Never let the token reach the log file.
+            Log("server: " + RedactToken(line));
+
+            const string prefix = "dsh web:";
+            if (!line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return;
+            string rest = line.Substring(prefix.Length).Trim();
+            int space = rest.IndexOf(' ');
+            if (space > 0)
+                rest = rest.Substring(0, space);   // drop the "(LAN: ...)" tail
+            if (!rest.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                && !rest.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return;
+            if (authUrl.Length > 0 && authUrl == rest)
+                return;                            // already known (line reprinted)
+            authUrl = rest;
+            Log("authenticated URL captured (token redacted)");
+            ThreadPool.QueueUserWorkItem(delegate { MintBrowserSession(); });
+        }
+
+        // Replace any token query value so logs stay shareable.
+        static string RedactToken(string line)
+        {
+            int at = line.IndexOf("token=", StringComparison.OrdinalIgnoreCase);
+            if (at < 0)
+                return line;
+            int end = line.IndexOfAny(new char[] { ' ', '&', '#', '"' }, at + 6);
+            return end < 0
+                ? line.Substring(0, at + 6) + "***"
+                : line.Substring(0, at + 6) + "***" + line.Substring(end);
+        }
+
+        // Exchange the process launch token for the signed session cookie. The
+        // server answers the authenticated URL with 303 + Set-Cookie and the
+        // CookieContainer keeps the cookie for every later /api call.
+        bool MintBrowserSession()
+        {
+            string target = authUrl;
+            if (target.Length == 0)
+                return false;
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(target);
+                req.CookieContainer = authCookies;
+                req.AllowAutoRedirect = false;   // the 303 and its Set-Cookie are all we want
+                req.Timeout = 5000;
+                using (var resp = (HttpWebResponse)req.GetResponse()) { }
+                authLogged = false;
+                bool ok = HasSessionCookie();
+                if (ok)
+                    SaveBrowserSession();
+                Log("token exchange: " + (ok ? "session cookie accepted" : "no cookie returned"));
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                Log("token exchange failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        bool HasSessionCookie()
+        {
+            try
+            {
+                foreach (Cookie c in authCookies.GetCookies(new Uri(url)))
+                    if (c.Name.StartsWith("dsh-auth-", StringComparison.Ordinal))
+                        return true;
+            }
+            catch { }
+            return false;
+        }
+
+        // Cache the session cookie so a later run - or a run that attached to a
+        // server it did not start - keeps working without the launch token.
+        void SaveBrowserSession()
+        {
+            try
+            {
+                foreach (Cookie c in authCookies.GetCookies(new Uri(url)))
+                {
+                    if (!c.Name.StartsWith("dsh-auth-", StringComparison.Ordinal))
+                        continue;
+                    var payload = new Dictionary<string, object> {
+                        { "authority", new Uri(url).Authority },
+                        { "name", c.Name },
+                        { "value", c.Value },
+                        { "expires", c.Expires.ToUniversalTime().ToString("o") },
+                    };
+                    string path = Config.SessionPath();
+                    string dir = Path.GetDirectoryName(path);
+                    if (!string.IsNullOrEmpty(dir))
+                        Directory.CreateDirectory(dir);
+                    File.WriteAllText(path, new JavaScriptSerializer().Serialize(payload));
+                    Log("browser session cached");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("session cache write failed: " + ex.Message);
+            }
+        }
+
+        void LoadBrowserSession()
+        {
+            try
+            {
+                string path = Config.SessionPath();
+                if (!File.Exists(path))
+                    return;
+                var ser = new JavaScriptSerializer();
+                var dict = ser.DeserializeObject(File.ReadAllText(path)) as Dictionary<string, object>;
+                if (dict == null)
+                    return;
+                // A cookie is bound to one authority and is worthless for another.
+                if (Convert.ToString(dict["authority"]) != new Uri(url).Authority)
+                {
+                    Log("cached session ignored: different authority");
+                    return;
+                }
+                object expiresObj;
+                if (dict.TryGetValue("expires", out expiresObj))
+                {
+                    DateTime expires;
+                    if (DateTime.TryParse(Convert.ToString(expiresObj), out expires)
+                        && expires.ToUniversalTime() <= DateTime.UtcNow)
+                    {
+                        Log("cached session ignored: expired");
+                        return;
+                    }
+                }
+                string name = Convert.ToString(dict["name"]);
+                string value = Convert.ToString(dict["value"]);
+                if (!name.StartsWith("dsh-auth-", StringComparison.Ordinal) || value.Length == 0)
+                    return;
+                authCookies.Add(new Cookie(name, value, "/", new Uri(url).Host));
+            }
+            catch (Exception ex)
+            {
+                Log("session cache read failed: " + ex.Message);
+            }
+        }
+
         bool IsServerUp()
         {
             try
             {
                 var req = (HttpWebRequest)WebRequest.Create(url);
                 req.Timeout = 1500;
+                req.AllowAutoRedirect = false;
                 using (var resp = (HttpWebResponse)req.GetResponse()) { }
                 return true;
+            }
+            catch (WebException we)
+            {
+                // Any answer at all means the port is served. A 401 in particular
+                // is now the normal unauthenticated reply, not a startup failure.
+                return we.Response != null;
             }
             catch
             {
@@ -905,17 +1180,51 @@ namespace DshLauncher
             }
         }
 
-        bool AnySessionRunning()
+        // True when any session is running. `known` reports whether the server
+        // actually answered - an unauthenticated or unreachable server leaves the
+        // busy state unknown, and the caller must not read that as "idle".
+        bool AnySessionRunning(out bool known)
         {
+            known = false;
+            bool running, unauthorized;
+            if (TrySessionList(out running, out unauthorized))
+            {
+                known = true;
+                return running;
+            }
+            // Retrying is pointless without a token: an attached server's token was
+            // never ours to read, and the cached session is the only thing that can
+            // work there. Re-authenticating only makes sense for a server we started.
+            if (unauthorized && authUrl.Length > 0)
+            {
+                // The cached cookie expired, or belongs to another deployment: ask
+                // the current process for a fresh one through the URL it printed.
+                Log("session list unauthorized; re-authenticating");
+                if (MintBrowserSession() && TrySessionList(out running, out unauthorized))
+                {
+                    known = true;
+                    return running;
+                }
+            }
+            return false;
+        }
+
+        bool TrySessionList(out bool running, out bool unauthorized)
+        {
+            running = false;
+            unauthorized = false;
             try
             {
-                var req = (HttpWebRequest)WebRequest.Create(url + "/api/session.list");
+                var req = (HttpWebRequest)WebRequest.Create(url + "/api/session/list");
                 req.Method = "POST";
                 req.ContentType = "application/json";
                 req.Timeout = 5000;
+                req.CookieContainer = authCookies;
+                // Canonical <namespace>/<method> endpoint; the Remote payload is a
+                // single `args` field whose keys are the method's wire parameters.
                 string body = "{\"type\":\"client-request\",\"rpcId\":\""
                     + Guid.NewGuid().ToString("N")
-                    + "\",\"method\":\"session.list\",\"payload\":{}}";
+                    + "\",\"method\":\"session/list\",\"payload\":{\"args\":{\"_request\":{}}}}";
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
                 req.ContentLength = bytes.Length;
                 using (var s = req.GetRequestStream())
@@ -929,7 +1238,13 @@ namespace DshLauncher
                 var root = ser.DeserializeObject(json) as Dictionary<string, object>;
                 if (root == null) return false;
                 var result = root["result"] as Dictionary<string, object>;
-                if (result == null || !(bool)result["ok"]) return false;
+                if (result == null) return false;
+                object ok;
+                if (!result.TryGetValue("ok", out ok) || !(ok is bool) || !(bool)ok)
+                {
+                    Log("session/list rejected: " + Truncate(json, 300));
+                    return false;
+                }
                 var value = result["value"] as Dictionary<string, object>;
                 if (value == null || !value.ContainsKey("items")) return false;
                 var items = value["items"] as object[];
@@ -937,9 +1252,16 @@ namespace DshLauncher
                 foreach (var it in items)
                 {
                     var d = it as Dictionary<string, object>;
-                    if (d != null && d.ContainsKey("running") && (bool)d["running"])
+                    if (d != null && d.ContainsKey("running") && (d["running"] is bool) && (bool)d["running"])
                         return true;
                 }
+                return true;
+            }
+            catch (WebException we)
+            {
+                var resp = we.Response as HttpWebResponse;
+                if (resp != null && resp.StatusCode == HttpStatusCode.Unauthorized)
+                    unauthorized = true;
                 return false;
             }
             catch
@@ -948,12 +1270,69 @@ namespace DshLauncher
             }
         }
 
+        static string Truncate(string text, int max)
+        {
+            if (text == null) return "";
+            return text.Length <= max ? text : text.Substring(0, max) + "...";
+        }
+
         // ---------------------------------------------------------------- ui open / exit
 
         void OpenApp()
         {
+            string target = authUrl;
+            if (target.Length == 0)
+            {
+                // The server prints its token URL a moment after it binds. Waiting
+                // for it is the difference between a working window and a 401 page,
+                // so a server we started always gets the chance to be heard.
+                if (weStartedServer && serverProcess != null)
+                {
+                    if (!authPending)
+                    {
+                        authPending = true;
+                        authPendingSinceUtc = DateTime.UtcNow;
+                        Log("open deferred until the token URL arrives");
+                    }
+                    return;
+                }
+                // Attached to a server we did not start: its launch token only ever
+                // existed on another process's stdout. With a cached session the
+                // browser almost certainly has one of its own, so the plain URL is
+                // fine; without one there is nothing to hand the browser, and the
+                // user has to use the URL that dsh web printed.
+                if (HasSessionCookie())
+                {
+                    Log("attached without a launch token; using the cached session");
+                }
+                else if (!authWarned)
+                {
+                    authWarned = true;
+                    Log("no launch token and no session: opening the plain URL");
+                    Balloon(lang.T("auth_missing"), ToolTipIcon.Warning);
+                }
+            }
+            OpenUrl(target.Length > 0 ? target : url);
+        }
+
+        void OpenUrl(string target)
+        {
             try
             {
+                // Chrome app window first. At the authenticated URL Chromium runs
+                // the token exchange itself - minting the persistent browser-session
+                // cookie - and then lands on the clean URL. The installed PWA cannot
+                // carry the token, so it stays a fallback for when no token is known.
+                string chrome = FindChrome();
+                if (chrome != null)
+                {
+                    var psi = new ProcessStartInfo(chrome,
+                        "--profile-directory=Default --app=\"" + target + "\"");
+                    psi.UseShellExecute = false;
+                    Process.Start(psi);
+                    Log("opened UI in a Chrome app window");
+                    return;
+                }
                 if (appId.Length > 0)
                 {
                     string internalLnk = Path.Combine(
@@ -975,14 +1354,8 @@ namespace DshLauncher
                         Process.Start(internalLnk);
                         return;
                     }
-                    string chrome = FindChrome();
-                    if (chrome != null)
-                    {
-                        Process.Start(chrome, "--profile-directory=Default --app-id=" + appId);
-                        return;
-                    }
                 }
-                Process.Start(url);
+                Process.Start(target);
             }
             catch (Exception ex)
             {
