@@ -134,6 +134,10 @@ Symptoms under 1.0.2: a running server read as down (so the launcher started a s
 
 1.0.4 fixes two problems 1.0.3 introduced: the UI opened in a plain `--app=<url>` window, so the taskbar showed the site favicon instead of your installed app icon; and "the service is already running but I cannot get its token" only produced a notice and changed nothing.
 
+1.0.5 修掉一个更隐蔽的取 token 失败：**插件往 stdout 写内容时不带换行**（例如 `dsh-approval-gate`），DSH 那行 `dsh web: http://…?token=…` 就被粘在插件输出后面。1.0.4 要求该行以 `dsh web:` 开头才认，于是 token 永远抓不到——重启服务也没用。现在改为在整行里匹配那个 URL（仍要求出现 `dsh web:` 标记，token 用的 base64url 字母表也保证尾部粘连的文字不会混进 token）。同时修好了日志里服务端中文输出乱码（按 UTF-8 解码），并给 token 交换加了重试限速（失败时不再每 3 秒一条日志）。
+
+1.0.5 fixes a subtler token failure: a plugin that writes to stdout **without a trailing newline** (for example `dsh-approval-gate`) glues DSH's own `dsh web: http://…?token=…` line onto the end of its output. 1.0.4 required that line to *start* with `dsh web:`, so the token was never captured and even a service restart did not help. The URL is now matched anywhere in the line (the `dsh web:` marker is still required, and the base64url token alphabet keeps text glued after the URL out of the token). The server's non-ASCII output is also decoded as UTF-8 in the log instead of arriving as mojibake, and token exchange attempts are rate-limited so a repeated failure no longer logs every 3 seconds.
+
 ## 注意 / Notes
 
 - 重启时会强制结束占用 `port` 的进程（`taskkill /T /F`，失败则直接终止该进程），请勿在服务运行关键任务时手动重启

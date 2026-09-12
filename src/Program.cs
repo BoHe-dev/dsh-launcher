@@ -36,6 +36,7 @@ using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -45,7 +46,7 @@ namespace DshLauncher
 {
     static class Program
     {
-        public const string Version = "1.0.4";
+        public const string Version = "1.0.5";
         public const string AppName = "DeepSeek Harness";
 
         internal static readonly string Suffix = Environment.GetEnvironmentVariable("DSH_MUTEX_SUFFIX") ?? "";
@@ -357,6 +358,8 @@ namespace DshLauncher
         DateTime authPendingSinceUtc;
         volatile bool authWarned;          // the user was already told, once
         volatile bool authLogged;          // the log already carries the diagnosis
+        DateTime serverStartedUtc;         // when StartServer last launched one
+        long lastMintAttemptTicks;         // rate limit for token exchange attempts
         // Interlocked ticks until which the BROWSER is known to hold a session of
         // its own (0 = unknown), so the installed app window can be used.
         long browserPrimedUntilTicks;
@@ -502,9 +505,12 @@ namespace DshLauncher
                         // assume work is running so an auto restart can never
                         // interrupt a chat it failed to observe.
                         busy = known ? running : true;
-                        // Not worth reporting while a server we started has simply
-                        // not printed its token yet - that resolves on its own.
-                        bool starting = weStartedServer && authUrl.Length == 0;
+                        // Not worth reporting while a server we started is still
+                        // starting up and has simply not printed its token yet. Past
+                        // that a missing token is a real fault and must be visible,
+                        // not silently swallowed as startup noise.
+                        bool starting = weStartedServer && authUrl.Length == 0
+                            && DateTime.UtcNow.Subtract(serverStartedUtc).TotalSeconds < 90;
                         if (!known && !starting && !authLogged && serverUp)
                         {
                             authLogged = true;
@@ -1028,6 +1034,10 @@ namespace DshLauncher
                 // read would deadlock as soon as a pipe buffer filled up.
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                // DSH and its plugins write UTF-8; without this the log mangles every
+                // non-ASCII line into meaningless noise.
+                psi.StandardOutputEncoding = Encoding.UTF8;
+                psi.StandardErrorEncoding = Encoding.UTF8;
                 var proc = new Process();
                 proc.StartInfo = psi;
                 proc.OutputDataReceived += OnServerOutput;
@@ -1037,6 +1047,7 @@ namespace DshLauncher
                 proc.BeginErrorReadLine();
                 serverProcess = proc;
                 weStartedServer = true;
+                serverStartedUtc = DateTime.UtcNow;
                 // A fresh server rewrites profile files at startup; don't treat
                 // those as plugin changes.
                 restartCooldownUntilUtc = DateTime.UtcNow.AddSeconds(60);
@@ -1049,9 +1060,15 @@ namespace DshLauncher
             }
         }
 
-        // Server stdout/stderr, off the UI thread. The only line that matters is
-        //   dsh web: http://127.0.0.1:3080/?token=<launch token> (LAN: ...)
-        // which is the sole way to learn the per-process token.
+        // The authenticated URL, matched *inside* a line rather than at its start.
+        // A plugin that writes to stdout without a trailing newline leaves DSH's
+        // "dsh web: ..." line glued to the end of that plugin's own output, so a
+        // line-prefix test misses the token entirely and the launcher never signs
+        // in. The marker is still required, and the base64url alphabet ends the
+        // match exactly - text glued after the URL can never leak into the token.
+        static readonly Regex AuthUrlPattern = new Regex(
+            "https?://[^\\s\"']*[?&]token=[A-Za-z0-9_\\-]{16,}", RegexOptions.IgnoreCase);
+
         void OnServerOutput(object sender, DataReceivedEventArgs e)
         {
             if (e == null || e.Data == null)
@@ -1062,19 +1079,15 @@ namespace DshLauncher
             // Never let the token reach the log file.
             Log("server: " + RedactToken(line));
 
-            const string prefix = "dsh web:";
-            if (!line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            if (line.IndexOf("dsh web:", StringComparison.OrdinalIgnoreCase) < 0)
                 return;
-            string rest = line.Substring(prefix.Length).Trim();
-            int space = rest.IndexOf(' ');
-            if (space > 0)
-                rest = rest.Substring(0, space);   // drop the "(LAN: ...)" tail
-            if (!rest.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                && !rest.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            Match match = AuthUrlPattern.Match(line);
+            if (!match.Success)
                 return;
-            if (authUrl.Length > 0 && authUrl == rest)
+            string found = match.Value;
+            if (authUrl == found)
                 return;                            // already known (line reprinted)
-            authUrl = rest;
+            authUrl = found;
             Log("authenticated URL captured (token redacted)");
             ThreadPool.QueueUserWorkItem(delegate { MintBrowserSession(); });
         }
@@ -1099,6 +1112,13 @@ namespace DshLauncher
             string target = authUrl;
             if (target.Length == 0)
                 return false;
+            // A refusal repeats on every poll, and the token is fixed for the life of
+            // the server process: one attempt a minute still recovers from a transient
+            // failure without turning the log into a 3-second loop.
+            if (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastMintAttemptTicks)
+                < TimeSpan.FromSeconds(60).Ticks)
+                return false;
+            Interlocked.Exchange(ref lastMintAttemptTicks, DateTime.UtcNow.Ticks);
             try
             {
                 var req = (HttpWebRequest)WebRequest.Create(target);
@@ -1277,7 +1297,7 @@ namespace DshLauncher
             {
                 // The cached cookie expired, or belongs to another deployment: ask
                 // the current process for a fresh one through the URL it printed.
-                Log("session list unauthorized; re-authenticating");
+                // MintBrowserSession itself logs the outcome and rate-limits repeats.
                 if (MintBrowserSession() && TrySessionList(out running, out unauthorized))
                 {
                     known = true;
