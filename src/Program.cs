@@ -45,7 +45,7 @@ namespace DshLauncher
 {
     static class Program
     {
-        public const string Version = "1.0.3";
+        public const string Version = "1.0.4";
         public const string AppName = "DeepSeek Harness";
 
         internal static readonly string Suffix = Environment.GetEnvironmentVariable("DSH_MUTEX_SUFFIX") ?? "";
@@ -273,7 +273,8 @@ namespace DshLauncher
             { "startup_timeout", "服务启动超时，请检查网络后重试（可再次双击本程序重新打开界面）" },
             { "confirm_restart_busy", "有聊天工作正在进行，重启会中断它。确定要现在重启服务吗？" },
             { "watchdog_restart", "服务异常退出，正在自动重启" },
-            { "auth_missing", "服务已在运行，但本程序拿不到它的访问令牌。请用 dsh web 启动时打印的带 token 的网址打开界面。" },
+            { "auth_missing", "服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌——因此无法判断聊天是否空闲，也无法安全地自动重启。界面照常打开；如需让本程序接管，请用托盘菜单重启服务。" },
+            { "takeover_ask", "检测到 DeepSeek Harness 服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌（只有启动它的那个进程知道）。\n\n后果：无法判断聊天是否空闲，插件变动后的自动重启不会执行。\n\n现在重启一次服务即可彻底修复（之后会记住约 30 天）。\n注意：如果有正在进行的聊天，重启会中断它。\n\n是否现在重启服务？" },
             { "config_failed", "config.json 解析失败，已使用默认配置。\n错误信息：{0}" },
             { "about_text", "DeepSeek Harness 托盘启动器\n版本 {0}\n\n自动启动服务、监控插件变动、聊天结束后自动重启。" },
         };
@@ -292,7 +293,8 @@ namespace DshLauncher
             { "startup_timeout", "Service startup timed out; check your network and double-click this app again" },
             { "confirm_restart_busy", "Chat work is in progress and will be interrupted. Restart the service anyway?" },
             { "watchdog_restart", "The service stopped unexpectedly; restarting automatically" },
-            { "auth_missing", "The service is running, but this app has no access token for it. Open the UI with the token URL printed by dsh web." },
+            { "auth_missing", "The service is running, but this app did not start it and cannot obtain its access token - so it cannot tell when chats are idle, nor restart safely. The UI still opens; use the tray menu to restart the service if you want this app to manage it." },
+            { "takeover_ask", "A DeepSeek Harness service is already running, but this app did not start it and cannot obtain its access token (only the process that started it knows it).\n\nConsequence: this app cannot tell when chats are idle, so automatic restarts after plugin changes will not happen.\n\nRestarting the service once fixes this permanently (it is remembered for about 30 days).\nNote: this interrupts any running chat.\n\nRestart the service now?" },
             { "config_failed", "config.json could not be parsed; using defaults.\nError: {0}" },
             { "about_text", "DeepSeek Harness tray launcher\nVersion {0}\n\nStarts the service, watches plugin changes and restarts automatically after chat work finishes." },
         };
@@ -355,6 +357,9 @@ namespace DshLauncher
         DateTime authPendingSinceUtc;
         volatile bool authWarned;          // the user was already told, once
         volatile bool authLogged;          // the log already carries the diagnosis
+        // Interlocked ticks until which the BROWSER is known to hold a session of
+        // its own (0 = unknown), so the installed app window can be used.
+        long browserPrimedUntilTicks;
 
         public TrayContext(EventWaitHandle openEvent)
         {
@@ -424,6 +429,12 @@ namespace DshLauncher
             {
                 everUp = true;
                 Interlocked.Exchange(ref lastServerUpTicks, DateTime.UtcNow.Ticks);
+                // A service we did not start can never hand over its launch token -
+                // only the process that printed it knows it. Without one (and with no
+                // cached session) the launcher cannot tell when chats are idle, so it
+                // could never restart safely. Restarting it once fixes that for good.
+                if (!HasSessionCookie() && !noRestart)
+                    OfferTakeOver();
                 if (cfg.openOnStart)
                     OpenApp();
             }
@@ -436,6 +447,24 @@ namespace DshLauncher
                 readyTimer.Start();
             }
             Log("init done, serverUp=" + serverUp);
+        }
+
+        // Offer to restart a service the launcher cannot manage. It is the only way
+        // to obtain a launch token, and it may cut short running work, so the choice
+        // belongs to the user rather than to a silent auto restart.
+        void OfferTakeOver()
+        {
+            Log("attached to a running service with no session; offering a take-over restart");
+            DialogResult r = MessageBox.Show(lang.T("takeover_ask"), cfg.appName,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r == DialogResult.Yes)
+            {
+                Log("take-over confirmed");
+                BeginRestart();
+                return;
+            }
+            Log("take-over declined; this service stays unmanaged");
+            authWarned = true;   // OpenApp must not repeat the same news as a balloon
         }
 
         // Background thread that keeps serverUp / busy fresh so the UI thread
@@ -506,9 +535,9 @@ namespace DshLauncher
                 else if (now.Subtract(authPendingSinceUtc).TotalSeconds > 30)
                 {
                     authPending = false;
-                    Log("token URL never arrived; opening the plain URL");
+                    Log("token URL never arrived; opening the installed app window");
                     Balloon(lang.T("auth_missing"), ToolTipIcon.Warning);
-                    OpenUrl(url);
+                    OpenInstalledApp();
                 }
             }
 
@@ -902,6 +931,22 @@ namespace DshLauncher
                 {
                     Log("taskkill failed: " + ex.Message);
                 }
+                // taskkill can refuse a process it cannot open (a service started by
+                // another account, a hardened tree). Terminating the listener itself
+                // is the fallback that still frees the port; re-reading the port owner
+                // first means a recycled pid can never be the one we terminate. If
+                // that fails too, the caller's stop timeout reports it instead of
+                // hanging.
+                try
+                {
+                    Thread.Sleep(1500);
+                    if (FindPortOwnerPid() == pid)
+                    {
+                        Process.GetProcessById(pid).Kill();
+                        Log("terminated pid " + pid + " directly (taskkill did not)");
+                    }
+                }
+                catch { }
             }
             serverProcess = null;
             weStartedServer = false;
@@ -1089,6 +1134,12 @@ namespace DshLauncher
 
         // Cache the session cookie so a later run - or a run that attached to a
         // server it did not start - keeps working without the launch token.
+        //
+        // The same file remembers when the *browser* was last handed the token URL
+        // (`primedUntil`). Our cookie and the browser's are minted by one exchange
+        // against one authority, so they carry the same lifetime: that shared expiry
+        // is what says the installed app window can be opened instead of a plain
+        // --app window, which would wear Chrome's favicon rather than the app icon.
         void SaveBrowserSession()
         {
             try
@@ -1097,11 +1148,14 @@ namespace DshLauncher
                 {
                     if (!c.Name.StartsWith("dsh-auth-", StringComparison.Ordinal))
                         continue;
+                    long primed = Interlocked.Read(ref browserPrimedUntilTicks);
                     var payload = new Dictionary<string, object> {
                         { "authority", new Uri(url).Authority },
                         { "name", c.Name },
                         { "value", c.Value },
                         { "expires", c.Expires.ToUniversalTime().ToString("o") },
+                        { "primedUntil", primed > 0
+                            ? new DateTime(primed, DateTimeKind.Utc).ToString("o") : "" },
                     };
                     string path = Config.SessionPath();
                     string dir = Path.GetDirectoryName(path);
@@ -1135,6 +1189,17 @@ namespace DshLauncher
                     Log("cached session ignored: different authority");
                     return;
                 }
+                object primedObj;
+                if (dict.TryGetValue("primedUntil", out primedObj))
+                {
+                    DateTime primed;
+                    if (DateTime.TryParse(Convert.ToString(primedObj), out primed)
+                        && primed.ToUniversalTime() > DateTime.UtcNow)
+                    {
+                        Interlocked.Exchange(ref browserPrimedUntilTicks, primed.ToUniversalTime().Ticks);
+                        Log("browser session marked primed until " + primed.ToUniversalTime().ToString("u"));
+                    }
+                }
                 object expiresObj;
                 if (dict.TryGetValue("expires", out expiresObj))
                 {
@@ -1156,6 +1221,19 @@ namespace DshLauncher
             {
                 Log("session cache read failed: " + ex.Message);
             }
+        }
+
+        // When our own session cookie expires - which is also when the browser's does.
+        DateTime SessionCookieExpiryUtc()
+        {
+            try
+            {
+                foreach (Cookie c in authCookies.GetCookies(new Uri(url)))
+                    if (c.Name.StartsWith("dsh-auth-", StringComparison.Ordinal))
+                        return c.Expires.ToUniversalTime();
+            }
+            catch { }
+            return DateTime.MinValue;
         }
 
         bool IsServerUp()
@@ -1278,6 +1356,11 @@ namespace DshLauncher
 
         // ---------------------------------------------------------------- ui open / exit
 
+        // Open the UI. The installed app window is preferred, because it carries the
+        // user's own icon, name and identity - a plain `--app=<url>` window would wear
+        // Chrome's favicon instead. The installed app cannot carry the launch token
+        // though, so the browser must already hold a session cookie: the token URL is
+        // opened once to establish that (see browserPrimedUntilTicks).
         void OpenApp()
         {
             string target = authUrl;
@@ -1297,42 +1380,70 @@ namespace DshLauncher
                     return;
                 }
                 // Attached to a server we did not start: its launch token only ever
-                // existed on another process's stdout. With a cached session the
-                // browser almost certainly has one of its own, so the plain URL is
-                // fine; without one there is nothing to hand the browser, and the
-                // user has to use the URL that dsh web printed.
-                if (HasSessionCookie())
-                {
-                    Log("attached without a launch token; using the cached session");
-                }
-                else if (!authWarned)
+                // existed on another process's stdout, so there is nothing to hand the
+                // browser. The installed app window is then the right choice - it works
+                // whenever the browser already holds a session, which it does whenever
+                // anyone has been using the UI.
+                if (!HasSessionCookie() && !authWarned)
                 {
                     authWarned = true;
-                    Log("no launch token and no session: opening the plain URL");
+                    Log("no launch token and no session; opening the installed app window");
                     Balloon(lang.T("auth_missing"), ToolTipIcon.Warning);
                 }
+                else
+                {
+                    Log("attached without a launch token; opening the installed app window");
+                }
+                OpenInstalledApp();
+                return;
             }
-            OpenUrl(target.Length > 0 ? target : url);
+
+            if (DateTime.UtcNow < new DateTime(Interlocked.Read(ref browserPrimedUntilTicks),
+                    DateTimeKind.Utc))
+            {
+                // The browser session established by an earlier token exchange is
+                // still inside its lifetime, so the installed app window will load.
+                OpenInstalledApp();
+                return;
+            }
+            PrimeBrowserSession(target);
         }
 
-        void OpenUrl(string target)
+        // Hand the browser the authenticated URL once. Chromium performs the token
+        // exchange itself, stores the signed cookie in its own profile, and lands on
+        // the clean URL - after which the installed app window is authenticated too.
+        void PrimeBrowserSession(string target)
         {
             try
             {
-                // Chrome app window first. At the authenticated URL Chromium runs
-                // the token exchange itself - minting the persistent browser-session
-                // cookie - and then lands on the clean URL. The installed PWA cannot
-                // carry the token, so it stays a fallback for when no token is known.
                 string chrome = FindChrome();
-                if (chrome != null)
+                if (chrome == null)
                 {
-                    var psi = new ProcessStartInfo(chrome,
-                        "--profile-directory=Default --app=\"" + target + "\"");
-                    psi.UseShellExecute = false;
-                    Process.Start(psi);
-                    Log("opened UI in a Chrome app window");
+                    Process.Start(target);
                     return;
                 }
+                var psi = new ProcessStartInfo(chrome,
+                    "--profile-directory=Default --app=\"" + target + "\"");
+                psi.UseShellExecute = false;
+                Process.Start(psi);
+                long ticks = SessionCookieExpiryUtc().Ticks;
+                if (ticks > 0)
+                    Interlocked.Exchange(ref browserPrimedUntilTicks, ticks);
+                SaveBrowserSession();
+                Log("opened the token URL once to establish the browser session");
+            }
+            catch (Exception ex)
+            {
+                Balloon(lang.T("fail_open") + ex.Message, ToolTipIcon.Error);
+            }
+        }
+
+        // The installed app window: the Chrome shortcut Chrome itself installed, its
+        // app-id, or - when there is no installed app - the best URL we have.
+        void OpenInstalledApp()
+        {
+            try
+            {
                 if (appId.Length > 0)
                 {
                     string internalLnk = Path.Combine(
@@ -1352,10 +1463,23 @@ namespace DshLauncher
                     if (File.Exists(internalLnk))
                     {
                         Process.Start(internalLnk);
+                        Log("opened the installed app window");
+                        return;
+                    }
+                    string chrome = FindChrome();
+                    if (chrome != null)
+                    {
+                        var psi = new ProcessStartInfo(chrome,
+                            "--profile-directory=Default --app-id=" + appId);
+                        psi.UseShellExecute = false;
+                        Process.Start(psi);
+                        Log("opened the installed app window (app-id)");
                         return;
                     }
                 }
-                Process.Start(target);
+                // No installed app to open: the token URL is the only thing that can
+                // authenticate a browser that has no session yet.
+                Process.Start(authUrl.Length > 0 ? authUrl : url);
             }
             catch (Exception ex)
             {
