@@ -2,9 +2,9 @@
 
 > DeepSeek Harness 托盘启动器 · A system-tray launcher for [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (DSH)
 
-把 DSH 的日常使用变成一个托盘小工具：双击启动，自动拉起服务、自动打开界面、插件变动自动重启、常驻系统托盘。
+把 DSH 的日常使用变成一个托盘小工具：双击启动，自动拉起服务、自动打开界面、常驻系统托盘。
 
-A tiny Windows tray app that turns DSH into a one-click tool: starts the service hidden, opens the UI, auto-restarts when plugins change, and lives in the system tray.
+A tiny Windows tray app that turns DSH into a one-click tool: starts the service hidden, opens the UI, and lives in the system tray.
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-blue) ![C#](https://img.shields.io/badge/.NET-Framework%204.x-512BD4) ![build](https://img.shields.io/github/actions/workflow/status/BoHe-dev/dsh-launcher/build.yml?label=build)
 
@@ -20,10 +20,8 @@ A tiny Windows tray app that turns DSH into a one-click tool: starts the service
   Opens the *installed* DeepSeek Harness app window, so the taskbar keeps your own icon and name instead of a plain `--app=` window wearing the site favicon.
 - **可以接管已在运行的服务**：若服务是别的进程启动的（只有那个进程知道 token），会问你要不要重启一次接管；接受后约 30 天内都不用再问
   Offers a one-time restart to take over a service started elsewhere (only the process that started it knows its token), then remembers it for about 30 days.
-- **插件变动自动重启**：监控 DSH 插件目录（`~/.dsh/profiles/web`），检测到插件安装/卸载/启停后，**等聊天工作全部结束**再自动重启服务（重启会关闭并重开界面，插件才生效）
-  Auto-restart on plugin changes: watches the plugin profile, waits until all agent work finishes, then restarts the service (web UIs are closed and reopened so plugins load).
-- **防写一半重启**：连续 3 秒没有新的插件变动才确认（每次新变动都会刷新计时）
-  3-second quiet window before confirming a change (new events refresh the timer).
+- **重启前先看有没有在聊天**：手动重启服务时，如果还有聊天在跑，会先弹窗确认，避免误中断
+  A manual restart asks first when a chat is still running, so a stray click cannot interrupt work.
 - **托盘菜单**：打开界面 / 重启服务 / 关于 / 退出；菜单跟随系统深浅色模式
   Tray menu: open UI / restart / about / exit; follows Windows light/dark mode.
 - **单实例**：重复双击只会重新打开界面
@@ -64,20 +62,19 @@ Download `dsh-launcher.exe` from Releases. No .NET SDK needed; Windows 10/11 shi
 | `port` | `3080` | DSH 服务端口 |
 | `serverCommand` | `npx @deepseek-ai/dsh web --no-open` | 启动服务的命令（`--no-open` 让服务不要自己开浏览器，界面由本程序负责） |
 | `workspace` | `""`（exe 所在目录） | 服务工作目录 |
-| `profileDir` | `""`（`~/.dsh/profiles/web`） | 插件监控目录 |
 | `chromeAppId` | `""`（自动发现） | DSH Chrome PWA 的 app-id；留空自动扫描 |
 | `language` | `"zh"` | `"zh"` 或 `"en"` |
 | `appName` | `"DeepSeek Harness"` | 托盘提示/气泡标题 |
 | `openOnStart` | `true` | 启动后自动打开界面 |
-| `autoRestart` | `true` | 插件变动自动重启总开关 |
 | `closeWebUisOnRestart` | `true` | 重启时关闭并重开界面窗口 |
 | `watchdog` | `true` | 服务意外退出时自动重启 |
-| `changeQuietSeconds` | `3` | 变动确认前的静默秒数 |
-| `idlePollSeconds` | `3` | 会话空闲轮询间隔（秒） |
-| `idleConfirmCount` | `2` | 连续几次空闲才重启 |
+| `idlePollSeconds` | `3` | 「有没有聊天在跑」的刷新间隔（秒） |
 | `stopTimeoutSeconds` | `15` | 等待旧服务停止上限 |
 | `startTimeoutSeconds` | `180` | 等待新服务启动上限 |
 | `logFile` | `""`（`%TEMP%\dsh-launcher.log`） | 日志路径 |
+
+> 1.0.5 及更早的配置里还有 `profileDir` / `autoRestart` / `changeQuietSeconds` / `idleConfirmCount` 四个键，它们配置的是已被移除的「插件变动自动重启」。留着不影响使用，程序会忽略它们。
+> Configs from 1.0.5 and earlier may still carry `profileDir` / `autoRestart` / `changeQuietSeconds` / `idleConfirmCount`. They configured the removed plugin-change auto restart; they are ignored now and can simply be left alone.
 
 ## 从源码构建 Build from source
 
@@ -97,7 +94,6 @@ GitHub Actions 会在打 `v*` 标签时自动构建并发布 Release。
 | 变量 | 作用 |
 |---|---|
 | `DSH_MUTEX_SUFFIX` | 单实例标识后缀（用于并行跑多个实例测试） |
-| `DSH_WATCH_DIR` | 覆盖插件监控目录 |
 | `DSH_NO_RESTART=1` | 只记录日志、不真正重启（安全测试） |
 
 ## 工作原理 How it works
@@ -106,12 +102,12 @@ GitHub Actions 会在打 `v*` 标签时自动构建并发布 Release。
    Starts the server hidden, reads the URL line off its stdout, and polls the port until ready.
 2. **登录**：`dsh web` 打印的 `?token=` 只属于那一个进程，所以程序把它换成 `dsh-auth-*` 会话 Cookie 供自己的 `/api` 调用；浏览器那份则用一次「带 token 网址」的访问建立起来（此后界面就能直接用已安装的应用窗口打开）
    Authentication: the `?token=` printed by `dsh web` belongs to that one process, so the launcher exchanges it once for a `dsh-auth-*` session cookie for its own `/api` calls; the browser's own copy is established by opening the token URL once, after which the installed app window loads normally.
-3. **空闲检测**：带会话 Cookie `POST /api/session/list`，看每个会话的 `running`
-   Idle detection via `POST /api/session/list` with that session cookie, checking every session's `running` flag.
-4. **插件监控**：只认清单文件（`package.json` / `pnpm-lock.yaml` / `pnpm-workspace.yaml` / `cordis.patch.yml`）和 `node_modules` 下新增/删除的包目录；插件包内部写入（缓存、运行时数据）一律忽略
-   Plugin watch: only manifest files and new/removed packages under `node_modules` count; runtime writes inside packages are ignored.
-5. **界面打开**：优先打开 Chrome 里已安装的 DeepSeek Harness 应用窗口（保你自己的图标）；浏览器还没有会话时，先用带 token 的网址建立一次，再走回应用窗口
+3. **聊天状态检测**：带会话 Cookie `POST /api/session/list`，看每个会话的 `running`；手动重启前用它判断要不要先问一句
+   Chat state via `POST /api/session/list` with that session cookie, checking every session's `running` flag; that is what makes a manual restart ask first.
+4. **界面打开**：优先打开 Chrome 里已安装的 DeepSeek Harness 应用窗口（保你自己的图标）；浏览器还没有会话时，先用带 token 的网址建立一次，再走回应用窗口
    UI open: the installed DeepSeek Harness app window when the browser holds a session (so your own icon survives), and the token URL once to establish that session when it does not.
+5. **看门狗**：服务自己退出（不是本程序重启的）时自动把它拉回来
+   Watchdog: brings the service back when it dies on its own rather than through a restart.
 
 ## 兼容性 Compatibility
 
@@ -138,16 +134,22 @@ Symptoms under 1.0.2: a running server read as down (so the launcher started a s
 
 1.0.5 fixes a subtler token failure: a plugin that writes to stdout **without a trailing newline** (for example `dsh-approval-gate`) glues DSH's own `dsh web: http://…?token=…` line onto the end of its output. 1.0.4 required that line to *start* with `dsh web:`, so the token was never captured and even a service restart did not help. The URL is now matched anywhere in the line (the `dsh web:` marker is still required, and the base64url token alphabet keeps text glued after the URL out of the token). The server's non-ASCII output is also decoded as UTF-8 in the log instead of arriving as mojibake, and token exchange attempts are rate-limited so a repeated failure no longer logs every 3 seconds.
 
+1.0.6 按需求**移除了「检测到插件变动自动重启服务」**：连同文件监控、静默确认窗口、等待聊天空闲再重启这一整套逻辑，以及 `profileDir` / `autoRestart` / `changeQuietSeconds` / `idleConfirmCount` 四个配置项和测试变量 `DSH_WATCH_DIR`。现在只有三种重启来源：手动（托盘菜单）、看门狗（服务自己挂了）、以及你点「是」的接管重启。同时把图标换成了新的鲸鱼娘。
+
+1.0.6 removes the **auto restart on plugin changes**, as requested: the file watcher, the quiet window, and the wait-until-idle-then-restart logic all go, together with the `profileDir` / `autoRestart` / `changeQuietSeconds` / `idleConfirmCount` options and the `DSH_WATCH_DIR` test variable. A restart now has exactly three sources: the tray menu, the watchdog (the service died on its own), and the take-over you explicitly confirm. The icon is also replaced with the new artwork.
+
 ## 注意 / Notes
 
+- 装了新插件或改了插件配置后**不会再自动重启**，需要自己右键托盘图标 →「重启服务」（重启后界面才会加载新插件）
+  Installing or changing a plugin no longer restarts anything by itself: use the tray menu's "Restart Service" (plugins only load on a fresh service + page).
 - 重启时会强制结束占用 `port` 的进程（`taskkill /T /F`，失败则直接终止该进程），请勿在服务运行关键任务时手动重启
   Restart force-kills the process listening on `port` (`taskkill /T /F`, falling back to terminating it directly); avoid manual restarts while critical work is running.
 - 重启会把 DSH 的网页窗口关掉并重新打开（插件需要全新加载）
   Restart closes and reopens the DSH web windows (plugins need a fresh page load).
-- 服务不是本程序启动的时候，只有启动它的那个进程知道 token。首次遇到会问你要不要重启一次接管；拒绝的话界面照常打开，但空闲检测不可用，自动重启会保守地暂停
-  When the service was started elsewhere, only the process that started it knows the token. The first time, the launcher asks whether to restart and take over; if you decline, the UI still opens, but idle detection is unavailable and auto-restart stays conservative.
-- 「服务已在运行但拿不到 token」时本程序无法判断聊天是否空闲——所以它**不会**冒然自动重启去打断你正在进行的聊天
-  With no token, the launcher cannot know whether a chat is running - so it never auto-restarts on a guess, and will not interrupt work in progress.
+- 服务不是本程序启动的时候，只有启动它的那个进程知道 token。首次遇到会问你要不要重启一次接管；拒绝的话界面照常打开，只是重启前不再提醒你正在进行的聊天
+  When the service was started elsewhere, only the process that started it knows the token. The first time, the launcher asks whether to restart and take over; if you decline, the UI still opens and only the "a chat is running" warning is unavailable.
+- 「服务已在运行但拿不到 token」时本程序无法判断有没有聊天在跑——这时它**不会**假装知道，也就不会用这个判断去拦你或骗你
+  With no token the launcher cannot know whether a chat is running - so it does not pretend to, and never uses that unknown as a reason to block you.
 
 ## License
 

@@ -1,14 +1,9 @@
 // dsh-launcher — DeepSeek Harness tray launcher (open-source edition)
-// - Starts the DSH server (default: npx @deepseek-ai/dsh web) hidden, waits until
-//   it is ready, opens the DeepSeek Harness UI, and stays in the system tray.
-// - Watches the DSH plugin profile directory for plugin changes
-//   (install/uninstall/enable/disable). A change is only confirmed after N seconds
-//   without any new change (each new event refreshes the timer). Once confirmed,
-//   waits until no session is running (all agent work done), then restarts the
-//   server automatically. On restart the web UI windows are closed and reopened so
-//   the new plugins load.
+// - Starts the DSH server (default: npx @deepseek-ai/dsh web --no-open) hidden,
+//   waits until it is ready, opens the DeepSeek Harness UI, and stays in the
+//   system tray.
 // - Tray menu: open UI / restart service / about / exit. Minimal notifications:
-//   one when a plugin change is confirmed, one when the restart begins, plus errors.
+//   one when a restart begins, plus errors.
 // - Everything user-specific is configurable via config.json next to the exe
 //   (see Config.Load). The Chrome PWA app-id is auto-detected when not configured.
 // - Authentication: since DSH 0.1.5 the web surface is gated behind a per-process
@@ -24,9 +19,10 @@
 //       same exchange and ends up on the clean URL,
 //     * and treats a 401 as "the server is up", because it no longer is a
 //       startup failure - it is an unauthenticated request.
+//   That session also answers "is a chat running?", which is what makes the
+//   manual restart ask before it interrupts work.
 // - Test-only environment overrides (documented in README):
 //   DSH_MUTEX_SUFFIX - separate single-instance identity (e.g. "test")
-//   DSH_WATCH_DIR    - plugin directory to watch instead of the configured one
 //   DSH_NO_RESTART=1 - log instead of actually restarting
 using System;
 using System.Collections.Generic;
@@ -46,7 +42,7 @@ namespace DshLauncher
 {
     static class Program
     {
-        public const string Version = "1.0.5";
+        public const string Version = "1.0.6";
         public const string AppName = "DeepSeek Harness";
 
         internal static readonly string Suffix = Environment.GetEnvironmentVariable("DSH_MUTEX_SUFFIX") ?? "";
@@ -115,17 +111,13 @@ namespace DshLauncher
         public int port = 3080;
         public string serverCommand = DefaultServerCommand;
         public string workspace = "";          // server working dir; "" = exe dir
-        public string profileDir = "";         // plugin watch dir; "" = ~/.dsh/profiles/web
         public string chromeAppId = "";        // "" = auto-detect the DSH Chrome PWA
         public string language = "zh";         // "zh" or "en"
         public string appName = "DeepSeek Harness";
         public bool openOnStart = true;
-        public bool autoRestart = true;        // master switch for plugin-change auto restart
         public bool closeWebUisOnRestart = true;
         public bool watchdog = true;           // restart the server if it dies on its own
-        public int changeQuietSeconds = 3;     // 3 s without new changes before confirming
-        public int idlePollSeconds = 3;        // session-idle poll interval
-        public int idleConfirmCount = 2;       // consecutive idle polls before restart
+        public int idlePollSeconds = 3;        // how often "is a chat running?" is refreshed
         public int stopTimeoutSeconds = 15;    // max wait for the old server to stop
         public int startTimeoutSeconds = 180;  // max wait for the new server to start
         public string logFile = "";            // "" = %TEMP%\dsh-launcher.log
@@ -208,20 +200,19 @@ namespace DshLauncher
                         case "port": cfg.port = Convert.ToInt32(kv.Value); break;
                         case "serverCommand": cfg.serverCommand = Convert.ToString(kv.Value); break;
                         case "workspace": cfg.workspace = Convert.ToString(kv.Value); break;
-                        case "profileDir": cfg.profileDir = Convert.ToString(kv.Value); break;
                         case "chromeAppId": cfg.chromeAppId = Convert.ToString(kv.Value); break;
                         case "language": cfg.language = Convert.ToString(kv.Value); break;
                         case "appName": cfg.appName = Convert.ToString(kv.Value); break;
                         case "openOnStart": cfg.openOnStart = Convert.ToBoolean(kv.Value); break;
-                        case "autoRestart": cfg.autoRestart = Convert.ToBoolean(kv.Value); break;
                         case "closeWebUisOnRestart": cfg.closeWebUisOnRestart = Convert.ToBoolean(kv.Value); break;
                         case "watchdog": cfg.watchdog = Convert.ToBoolean(kv.Value); break;
-                        case "changeQuietSeconds": cfg.changeQuietSeconds = Convert.ToInt32(kv.Value); break;
                         case "idlePollSeconds": cfg.idlePollSeconds = Convert.ToInt32(kv.Value); break;
-                        case "idleConfirmCount": cfg.idleConfirmCount = Convert.ToInt32(kv.Value); break;
                         case "stopTimeoutSeconds": cfg.stopTimeoutSeconds = Convert.ToInt32(kv.Value); break;
                         case "startTimeoutSeconds": cfg.startTimeoutSeconds = Convert.ToInt32(kv.Value); break;
                         case "logFile": cfg.logFile = Convert.ToString(kv.Value); break;
+                        // profileDir / autoRestart / changeQuietSeconds / idleConfirmCount
+                        // configured the plugin-change auto restart, which is gone. An
+                        // old config.json simply keeps them as unknown keys.
                     }
                 }
                 catch { }
@@ -265,7 +256,6 @@ namespace DshLauncher
             { "restart", "重启服务" },
             { "about", "关于" },
             { "exit", "退出（停止服务）" },
-            { "plugin_change", "检测到插件变动，将在聊天结束后自动重启服务" },
             { "restarting", "正在重启服务，稍候会自动重新打开界面" },
             { "fail_stop", "服务重启失败：无法停止旧服务" },
             { "fail_timeout", "服务重启失败：启动超时，请右键托盘图标手动重试" },
@@ -274,10 +264,10 @@ namespace DshLauncher
             { "startup_timeout", "服务启动超时，请检查网络后重试（可再次双击本程序重新打开界面）" },
             { "confirm_restart_busy", "有聊天工作正在进行，重启会中断它。确定要现在重启服务吗？" },
             { "watchdog_restart", "服务异常退出，正在自动重启" },
-            { "auth_missing", "服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌——因此无法判断聊天是否空闲，也无法安全地自动重启。界面照常打开；如需让本程序接管，请用托盘菜单重启服务。" },
-            { "takeover_ask", "检测到 DeepSeek Harness 服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌（只有启动它的那个进程知道）。\n\n后果：无法判断聊天是否空闲，插件变动后的自动重启不会执行。\n\n现在重启一次服务即可彻底修复（之后会记住约 30 天）。\n注意：如果有正在进行的聊天，重启会中断它。\n\n是否现在重启服务？" },
+            { "auth_missing", "服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌——因此无法判断聊天是否空闲，重启时也就不会提醒你。界面照常打开；如需让本程序接管，请用托盘菜单重启服务。" },
+            { "takeover_ask", "检测到 DeepSeek Harness 服务已在运行，但它不是本程序启动的，本程序拿不到它的访问令牌（只有启动它的那个进程知道）。\n\n后果：无法判断聊天是否空闲，手动重启时不会提醒你正在进行的聊天。\n\n现在重启一次服务即可彻底修复（之后会记住约 30 天）。\n注意：如果有正在进行的聊天，重启会中断它。\n\n是否现在重启服务？" },
             { "config_failed", "config.json 解析失败，已使用默认配置。\n错误信息：{0}" },
-            { "about_text", "DeepSeek Harness 托盘启动器\n版本 {0}\n\n自动启动服务、监控插件变动、聊天结束后自动重启。" },
+            { "about_text", "DeepSeek Harness 托盘启动器\n版本 {0}\n\n一键启动服务、打开界面并常驻托盘；重启前会先看你有没有正在进行的聊天。" },
         };
 
         static readonly Dictionary<string, string> en = new Dictionary<string, string> {
@@ -285,7 +275,6 @@ namespace DshLauncher
             { "restart", "Restart Service" },
             { "about", "About" },
             { "exit", "Exit (Stop Service)" },
-            { "plugin_change", "Plugin change detected; the service will restart after chat work finishes" },
             { "restarting", "Restarting the service, the UI will reopen shortly" },
             { "fail_stop", "Restart failed: could not stop the old service" },
             { "fail_timeout", "Restart failed: startup timeout, retry from the tray menu" },
@@ -294,10 +283,10 @@ namespace DshLauncher
             { "startup_timeout", "Service startup timed out; check your network and double-click this app again" },
             { "confirm_restart_busy", "Chat work is in progress and will be interrupted. Restart the service anyway?" },
             { "watchdog_restart", "The service stopped unexpectedly; restarting automatically" },
-            { "auth_missing", "The service is running, but this app did not start it and cannot obtain its access token - so it cannot tell when chats are idle, nor restart safely. The UI still opens; use the tray menu to restart the service if you want this app to manage it." },
-            { "takeover_ask", "A DeepSeek Harness service is already running, but this app did not start it and cannot obtain its access token (only the process that started it knows it).\n\nConsequence: this app cannot tell when chats are idle, so automatic restarts after plugin changes will not happen.\n\nRestarting the service once fixes this permanently (it is remembered for about 30 days).\nNote: this interrupts any running chat.\n\nRestart the service now?" },
+            { "auth_missing", "The service is running, but this app did not start it and cannot obtain its access token - so it cannot tell whether a chat is running, and a restart will not warn you. The UI still opens; use the tray menu to restart the service if you want this app to manage it." },
+            { "takeover_ask", "A DeepSeek Harness service is already running, but this app did not start it and cannot obtain its access token (only the process that started it knows it).\n\nConsequence: this app cannot tell whether a chat is running, so a manual restart will not warn you about work in progress.\n\nRestarting the service once fixes this permanently (it is remembered for about 30 days).\nNote: this interrupts any running chat.\n\nRestart the service now?" },
             { "config_failed", "config.json could not be parsed; using defaults.\nError: {0}" },
-            { "about_text", "DeepSeek Harness tray launcher\nVersion {0}\n\nStarts the service, watches plugin changes and restarts automatically after chat work finishes." },
+            { "about_text", "DeepSeek Harness tray launcher\nVersion {0}\n\nStarts the service, opens the UI and stays in the tray; a restart asks first when a chat is running." },
         };
     }
 
@@ -309,7 +298,6 @@ namespace DshLauncher
         readonly Lang lang;
         readonly string url;
         readonly string workspace;
-        readonly string watchDir;
         readonly string logPath;
         readonly bool noRestart;
         readonly string appId;   // detected or configured Chrome PWA app-id ("" = none)
@@ -326,19 +314,9 @@ namespace DshLauncher
         FormsTimer readyTimer;
         int waitTicks;
 
-        // plugin watch
-        FileSystemWatcher watcher;
-        bool pluginEventSeen;
-        long lastPluginEventTicks;
-        long lastFsLogTicks;
-        bool pendingRestart;
-        DateTime restartCooldownUntilUtc;
-
         // restart machine
         int restartPhase;            // 0 idle, 1 wait-port-down, 2 wait-ready
         DateTime phaseDeadline;
-        int idlePollTicks;
-        int idleStreak;
 
         // background poller results (updated off the UI thread so the tray never
         // blocks on network / WMI / netstat calls)
@@ -377,17 +355,13 @@ namespace DshLauncher
             workspace = cfg.workspace.Length > 0
                 ? cfg.workspace
                 : Path.GetDirectoryName(Application.ExecutablePath);
-            watchDir = Environment.GetEnvironmentVariable("DSH_WATCH_DIR")
-                ?? (cfg.profileDir.Length > 0 ? ExpandHome(cfg.profileDir)
-                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                        ".dsh", "profiles", "web"));
             logPath = cfg.logFile.Length > 0 ? cfg.logFile
                 : Path.Combine(Path.GetTempPath(), "dsh-launcher" + Program.Suffix + ".log");
             noRestart = Environment.GetEnvironmentVariable("DSH_NO_RESTART") == "1";
             appId = cfg.chromeAppId.Length > 0 ? cfg.chromeAppId : DetectChromeAppId();
             LoadBrowserSession();
             Log("--- " + cfg.appName + " " + Program.Version + " start, port=" + cfg.port
-                + ", watch=" + watchDir + ", appId=" + (appId.Length > 0 ? appId : "(none)")
+                + ", appId=" + (appId.Length > 0 ? appId : "(none)")
                 + ", lang=" + cfg.language + ", noRestart=" + noRestart
                 + ", sessionCookie=" + (authCookies.Count > 0 ? "cached" : "none"));
 
@@ -415,11 +389,6 @@ namespace DshLauncher
             signalTimer.Tick += delegate { if (openEvent.WaitOne(0)) OpenApp(); };
             signalTimer.Start();
 
-            if (cfg.autoRestart)
-                SetupWatcher();
-            else
-                Log("autoRestart disabled, plugin watch skipped");
-
             var house = new FormsTimer();
             house.Interval = 1000;
             house.Tick += HouseTick;
@@ -434,8 +403,9 @@ namespace DshLauncher
                 Interlocked.Exchange(ref lastServerUpTicks, DateTime.UtcNow.Ticks);
                 // A service we did not start can never hand over its launch token -
                 // only the process that printed it knows it. Without one (and with no
-                // cached session) the launcher cannot tell when chats are idle, so it
-                // could never restart safely. Restarting it once fixes that for good.
+                // cached session) the launcher cannot tell whether a chat is running,
+                // so a manual restart could not warn about interrupting it. Restarting
+                // the service once fixes that for good.
                 if (!HasSessionCookie() && !noRestart)
                     OfferTakeOver();
                 if (cfg.openOnStart)
@@ -547,11 +517,11 @@ namespace DshLauncher
                 }
             }
 
-            // 0b) watchdog: the server was up but has now been down for a while and
+            // 1) watchdog: the server was up but has now been down for a while and
             //    it is not because of us - bring it back. Only armed after the
             //    initial startup finished (readyTimer == null).
             if (cfg.watchdog && everUp && !serverUp && restartPhase == 0
-                && !pendingRestart && readyTimer == null
+                && readyTimer == null
                 && now.Subtract(new DateTime(Interlocked.Read(ref lastServerUpTicks))).TotalSeconds > 12)
             {
                 Log("Watchdog: server down -> auto restart");
@@ -559,47 +529,7 @@ namespace DshLauncher
                 BeginRestart();
             }
 
-            // 1) plugin change: confirmed only after changeQuietSeconds without any
-            //    new change (each new event refreshes the timer)
-            if (pluginEventSeen && restartPhase == 0 && now >= restartCooldownUntilUtc)
-            {
-                if (now.Subtract(new DateTime(Interlocked.Read(ref lastPluginEventTicks))).TotalSeconds
-                    >= cfg.changeQuietSeconds)
-                {
-                    pluginEventSeen = false;
-                    if (!pendingRestart)
-                    {
-                        pendingRestart = true;
-                        Log("Plugin change confirmed -> pending restart");
-                        Balloon(lang.T("plugin_change"));
-                    }
-                }
-            }
-
-            // 2) idle wait (uses the background poller's cached busy result)
-            idlePollTicks++;
-            if (idlePollTicks * 1000 >= cfg.idlePollSeconds * 1000)
-            {
-                idlePollTicks = 0;
-                if (pendingRestart && restartPhase == 0)
-                {
-                    if (busy)
-                        idleStreak = 0;
-                    else
-                    {
-                        idleStreak++;
-                        if (idleStreak >= cfg.idleConfirmCount)
-                        {
-                            idleStreak = 0;
-                            pendingRestart = false;
-                            Log("Idle confirmed -> auto restart");
-                            BeginRestart();
-                        }
-                    }
-                }
-            }
-
-            // 3) restart machine (uses the cached serverUp value)
+            // 2) restart machine (uses the cached serverUp value)
             if (restartPhase == 1)
             {
                 if (!serverUp)
@@ -621,8 +551,6 @@ namespace DshLauncher
                 if (serverUp)
                 {
                     restartPhase = 0;
-                    restartCooldownUntilUtc = now.AddSeconds(60);
-                    pluginEventSeen = false;   // clear events captured during the restart
                     Log("Restart complete");
                     OpenApp();   // the web UIs were closed during the restart: reopen fresh
                 }
@@ -639,8 +567,8 @@ namespace DshLauncher
                 }
             }
 
-            // 4) tray tooltip state + follow system light/dark mode
-            string suffix = restartPhase != 0 ? " *" : pendingRestart ? " (pending)" : "";
+            // 3) tray tooltip state + follow system light/dark mode
+            string suffix = restartPhase != 0 ? " *" : "";
             icon.Text = cfg.appName + suffix;
 
             if (++themeCheckTicks >= 5)
@@ -669,96 +597,6 @@ namespace DshLauncher
             }
         }
 
-        // ---------------------------------------------------------------- plugin watch
-
-        void SetupWatcher()
-        {
-            try
-            {
-                if (!Directory.Exists(watchDir))
-                {
-                    Log("watch dir missing: " + watchDir);
-                    return;
-                }
-                watcher = new FileSystemWatcher(watchDir);
-                watcher.IncludeSubdirectories = true;
-                watcher.InternalBufferSize = 65536;
-                watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName
-                    | NotifyFilters.DirectoryName | NotifyFilters.Size;
-                watcher.Changed += OnPluginFsEvent;
-                watcher.Created += OnPluginFsEvent;
-                watcher.Deleted += OnPluginFsEvent;
-                watcher.Renamed += OnPluginFsEvent;
-                watcher.Error += delegate { Log("FSW error event"); };
-                watcher.EnableRaisingEvents = true;
-                Log("Watcher active");
-            }
-            catch (Exception ex)
-            {
-                Log("Watcher setup failed: " + ex.Message);
-            }
-        }
-
-        void OnPluginFsEvent(object sender, FileSystemEventArgs e)
-        {
-            // cordis.yml is the server-composed plugin-tree root: the server rewrites
-            // it on every startup. It is NOT a user plugin change, so ignore it.
-            if (string.Equals(e.FullPath, Path.Combine(watchDir, "cordis.yml"),
-                    StringComparison.OrdinalIgnoreCase))
-                return;
-
-            // Atomic-write temp files ("_tmp_<pid>_<rand>"): the renamed final file
-            // fires its own event, so the temp name alone must not count.
-            string name = Path.GetFileName(e.FullPath);
-            if (name != null && name.StartsWith("_tmp_", StringComparison.OrdinalIgnoreCase))
-                return;
-
-            // Only real plugin changes count:
-            //  - top-level manifest files (package.json, pnpm-lock.yaml,
-            //    pnpm-workspace.yaml, cordis.patch.yml);
-            //  - the node_modules package directory itself being created/deleted
-            //    (node_modules\pkg or node_modules\@scope\pkg).
-            // Anything deeper (files inside installed packages, caches, runtime
-            // state) is ignored.
-            string rel = e.FullPath;
-            if (e.FullPath.StartsWith(watchDir, StringComparison.OrdinalIgnoreCase))
-                rel = e.FullPath.Substring(watchDir.Length).TrimStart('\\', '/');
-            string[] parts = rel.Split(new char[] { '\\', '/' });
-            if (parts.Length == 1)
-            {
-                bool manifest = name == "package.json" || name == "pnpm-lock.yaml"
-                    || name == "pnpm-workspace.yaml" || name == "cordis.patch.yml";
-                if (!manifest)
-                    return;
-            }
-            else if (parts.Length >= 2 && parts[0].Equals("node_modules", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!(e.ChangeType == WatcherChangeTypes.Created || e.ChangeType == WatcherChangeTypes.Deleted))
-                    return;
-                if (parts.Length != 2 && !(parts.Length == 3 && parts[1].StartsWith("@")))
-                    return;
-            }
-            else
-            {
-                return;
-            }
-
-            // During our own restart, or shortly after we started a server, profile
-            // writes are startup noise, not user plugin changes - drop them.
-            if (restartPhase != 0 || DateTime.UtcNow < restartCooldownUntilUtc)
-                return;
-
-            // Throttled per-event log for diagnosis.
-            long nowTicks = DateTime.UtcNow.Ticks;
-            if (nowTicks - lastFsLogTicks > TimeSpan.FromSeconds(2).Ticks)
-            {
-                lastFsLogTicks = nowTicks;
-                Log("FSW: " + e.ChangeType + " " + e.FullPath);
-            }
-            pluginEventSeen = true;
-            Interlocked.Exchange(ref lastPluginEventTicks, nowTicks);
-        }
-
         // ---------------------------------------------------------------- restart
 
         void MenuRestart()
@@ -774,7 +612,6 @@ namespace DshLauncher
                 if (r != DialogResult.Yes)
                     return;
             }
-            pendingRestart = false;
             Log("Manual restart requested");
             BeginRestart();
         }
@@ -1048,9 +885,6 @@ namespace DshLauncher
                 serverProcess = proc;
                 weStartedServer = true;
                 serverStartedUtc = DateTime.UtcNow;
-                // A fresh server rewrites profile files at startup; don't treat
-                // those as plugin changes.
-                restartCooldownUntilUtc = DateTime.UtcNow.AddSeconds(60);
                 Log("Server started (pid " + serverProcess.Id + ")");
             }
             catch (Exception ex)
@@ -1585,11 +1419,6 @@ namespace DshLauncher
             if (readyTimer != null)
                 readyTimer.Stop();
             pollRunning = false;   // stop the background poller
-            if (watcher != null)
-            {
-                watcher.EnableRaisingEvents = false;
-                watcher.Dispose();
-            }
             icon.Visible = false;
             icon.Dispose();
             menu.Dispose();
@@ -1679,16 +1508,6 @@ namespace DshLauncher
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message + Environment.NewLine);
             }
             catch { }
-        }
-
-        static string ExpandHome(string path)
-        {
-            if (path == "~")
-                return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            if (path.StartsWith("~/") || path.StartsWith("~\\"))
-                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    path.Substring(2));
-            return path;
         }
     }
 
